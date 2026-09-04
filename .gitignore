@@ -1,0 +1,11 @@
+/.venv/
+/.cache/
+/data/
+/pretrained/
+/outputs/
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+.pytest_cache/
+.ruff_cache/
