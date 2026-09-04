@@ -100,6 +100,9 @@ ADAPTER_PATH=outputs/<run>/checkpoint-<step> \
   bash scripts/evaluate.sh
 ```
 
+Evidence-injection causal ablations, gate/residual statistics, paired bootstrap confidence intervals, and the
+four-model efficiency benchmark are documented in [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
+
 The evaluator reports exact match, ANLS, mean IoU, and grounded accuracy. For
 SROIE, bounding boxes are OCR-aligned proxy supervision and spatial metrics
 must be reported as proxy-grounding results rather than official SROIE scores.

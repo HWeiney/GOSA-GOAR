@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import torch
 
@@ -68,6 +70,58 @@ def test_goar_inference_without_target_only_injects_prompt_features():
     assert not torch.equal(output, embeds)
     # Non-OCR content before the final prompt token remains untouched.
     torch.testing.assert_close(output[:, 0], embeds[:, 0])
+
+
+def test_goar_injection_switches_form_the_four_causal_modes():
+    torch.manual_seed(12)
+    module = GOSAOCRAnchorRefinement(hidden_size=12, bottleneck=6)
+    module.eval()
+    torch.nn.init.normal_(module.spatial_out[-1].weight, std=0.02)
+    torch.nn.init.normal_(module.evidence_out.weight, std=0.02)
+    embeds = torch.randn(1, 9, 12)
+    visual = torch.randn(1, 4, 12)
+    tile = torch.tensor([[0., 0., 1., 1.]])
+    outputs = {}
+    for name, spatial, evidence in (
+            ('full', True, True), ('none', False, False),
+            ('spatial', True, False), ('evidence', False, True)):
+        module.spatial_injection = spatial
+        module.ocr_evidence_injection = evidence
+        outputs[name], _, _ = module(embeds, [_sample_data(target=False)], visual, tile)
+
+    torch.testing.assert_close(outputs['none'], embeds)
+    torch.testing.assert_close(outputs['full'] - embeds,
+                               (outputs['spatial'] - embeds) + (outputs['evidence'] - embeds))
+    assert not torch.equal(outputs['spatial'], embeds)
+    assert not torch.equal(outputs['evidence'], embeds)
+
+
+def test_goar_records_gate_and_residual_ratios(tmp_path):
+    torch.manual_seed(14)
+    path = tmp_path / 'stats.jsonl'
+    module = GOSAOCRAnchorRefinement(
+        hidden_size=12, bottleneck=6, record_injection_stats=True, injection_stats_path=str(path))
+    module.eval()
+    torch.nn.init.normal_(module.spatial_out[-1].weight, std=0.02)
+    torch.nn.init.normal_(module.evidence_out.weight, std=0.02)
+    embeds = torch.randn(1, 9, 12)
+    visual = torch.randn(1, 4, 12)
+    tile = torch.tensor([[0., 0., 1., 1.]])
+
+    module(embeds, [_sample_data(target=False)], visual, tile)
+
+    record = json.loads(path.read_text(encoding='utf-8'))
+    assert record['gate'] == pytest.approx(0.1)
+    assert record['spatial_residual_ratio'] > 0
+    assert record['ocr_evidence_residual_ratio'] > 0
+    assert record['ocr_line_count'] == 2
+
+
+def test_goar_rejects_disabled_injection_during_training():
+    module = GOSAOCRAnchorRefinement(hidden_size=8, bottleneck=4, spatial_injection=False)
+    with pytest.raises(ValueError, match='inference-only'):
+        module(torch.randn(1, 9, 8), [_sample_data()], torch.randn(1, 4, 8),
+               torch.tensor([[0., 0., 1., 1.]]))
 
 
 def test_goar_empty_ocr_uses_supervised_visual_fallback():

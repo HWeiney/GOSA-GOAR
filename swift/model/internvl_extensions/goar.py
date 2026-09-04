@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import os
+import json
+from pathlib import Path
 from types import MethodType
 from typing import Any, Dict, List, Sequence
 
@@ -70,7 +72,9 @@ class GOSAOCRAnchorRefinement(nn.Module):
                  pointer_loss_weight: float = 0.2, branch_loss_weight: float = 0.25,
                  uncertainty_loss_weight: float = 0.1, loss_weight: float = 1.0,
                  inference_box_mode: str = 'fusion', use_roi_feature: bool = True,
-                 source_fusion_mode: str = 'uncertainty', refine_ocr_anchor: bool = True):
+                 source_fusion_mode: str = 'uncertainty', refine_ocr_anchor: bool = True,
+                 spatial_injection: bool = True, ocr_evidence_injection: bool = True,
+                 record_injection_stats: bool = False, injection_stats_path: str | None = None):
         super().__init__()
         self.max_ocr_lines = max_ocr_lines
         self.pointer_loss_weight = pointer_loss_weight
@@ -81,6 +85,13 @@ class GOSAOCRAnchorRefinement(nn.Module):
         self.use_roi_feature = use_roi_feature
         self.source_fusion_mode = self._validate_source_fusion_mode(source_fusion_mode)
         self.refine_ocr_anchor = bool(refine_ocr_anchor)
+        self.spatial_injection = bool(spatial_injection)
+        self.ocr_evidence_injection = bool(ocr_evidence_injection)
+        self.record_injection_stats = bool(record_injection_stats)
+        self.injection_stats_path = injection_stats_path
+        self._injection_stats_index = 0
+        if self.record_injection_stats and not self.injection_stats_path:
+            raise ValueError('GOAR_INJECTION_STATS_PATH is required when GOAR_RECORD_INJECTION_STATS=True')
         self.text_proj = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, bottleneck))
         self.visual_proj = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, bottleneck))
         self.question_proj = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, bottleneck))
@@ -165,8 +176,49 @@ class GOSAOCRAnchorRefinement(nn.Module):
             indices = torch.arange(embeds.shape[0], device=embeds.device)
         return embeds[indices].mean(dim=0), int(indices[-1])
 
+    @staticmethod
+    def _residual_ratio(delta: torch.Tensor, hidden: torch.Tensor) -> float:
+        numerator = torch.linalg.vector_norm(delta.float())
+        denominator = torch.linalg.vector_norm(hidden.float()).clamp_min(1e-12)
+        return float((numerator / denominator).detach().cpu())
+
+    def _write_injection_stats(self, gate: torch.Tensor, spatial_delta: torch.Tensor,
+                               evidence_delta: torch.Tensor | None, embeds: torch.Tensor,
+                               injection_index: int, lines, pointer: torch.Tensor | None) -> None:
+        if not self.record_injection_stats:
+            return
+        gated_spatial = gate * spatial_delta
+        spatial_ratio = self._residual_ratio(gated_spatial, embeds[injection_index])
+        evidence_ratio = None
+        if evidence_delta is not None and pointer is not None:
+            delta_parts = [(gate * evidence_delta).unsqueeze(0)]
+            hidden_parts = [embeds[injection_index].unsqueeze(0)]
+            for weight, (start, end, _, _) in zip(pointer, lines):
+                token_count = end - start
+                if token_count <= 0:
+                    continue
+                delta_parts.append((gate * weight.to(dtype=embeds.dtype) * evidence_delta).expand(token_count, -1))
+                hidden_parts.append(embeds[start:end])
+            evidence_ratio = self._residual_ratio(torch.cat(delta_parts), torch.cat(hidden_parts))
+        record = {
+            'sample_index': self._injection_stats_index,
+            'gate': float(gate.detach().float().cpu()),
+            'spatial_residual_ratio': spatial_ratio,
+            'ocr_evidence_residual_ratio': evidence_ratio,
+            'ocr_line_count': len(lines),
+            'spatial_injection_enabled': self.spatial_injection,
+            'ocr_evidence_injection_enabled': self.ocr_evidence_injection,
+        }
+        self._injection_stats_index += 1
+        stats_path = Path(self.injection_stats_path)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        with stats_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + '\n')
+
     def _sample_forward(self, embeds: torch.Tensor, labels: torch.Tensor | None, data: Dict[str, Any],
                         visual: torch.Tensor, tile_boxes: torch.Tensor, visual_mask: torch.Tensor | None = None):
+        if self.training and not (self.spatial_injection and self.ocr_evidence_injection):
+            raise ValueError('GOAR injection switches are inference-only; enable both paths during training')
         record, spans = data.get('ocr', {}), data.get('line_spans', [])
         bboxes, confidences = record.get('bboxes', []), record.get('confidences', [])
         offset = int(data.get('padding_offset', 0))
@@ -207,8 +259,10 @@ class GOSAOCRAnchorRefinement(nn.Module):
             gate = self.injection_gate_logit.sigmoid().to(dtype=embeds.dtype)
             spatial_delta = self.spatial_out(
                 visual_box.to(dtype=self.spatial_out[0].weight.dtype)).to(dtype=embeds.dtype)
+            self._write_injection_stats(gate, spatial_delta, None, embeds, injection_index, [], None)
             output = embeds.clone()
-            output[injection_index] += gate * spatial_delta
+            if self.spatial_injection:
+                output[injection_index] += gate * spatial_delta
 
             target = self._valid_box(data.get('target', []), embeds.device)
             if target is None:
@@ -280,10 +334,14 @@ class GOSAOCRAnchorRefinement(nn.Module):
         spatial_delta = self.spatial_out(
             injection_box.to(dtype=self.spatial_out[0].weight.dtype)).to(dtype=embeds.dtype)
         evidence_delta = self.evidence_out(evidence).to(dtype=embeds.dtype)
+        self._write_injection_stats(gate, spatial_delta, evidence_delta, embeds, injection_index, lines, pointer)
         output = embeds.clone()
-        output[injection_index] += gate * (spatial_delta + evidence_delta)
-        for weight, (start, end, _, _) in zip(pointer, lines):
-            output[start:end] += gate * weight.to(dtype=embeds.dtype) * evidence_delta
+        if self.spatial_injection:
+            output[injection_index] += gate * spatial_delta
+        if self.ocr_evidence_injection:
+            output[injection_index] += gate * evidence_delta
+            for weight, (start, end, _, _) in zip(pointer, lines):
+                output[start:end] += gate * weight.to(dtype=embeds.dtype) * evidence_delta
 
         target = self._valid_box(data.get('target', []), embeds.device)
         if target is None:
@@ -378,6 +436,10 @@ def attach_goar(model: nn.Module) -> bool:
         use_roi_feature=_env_bool('GOAR_USE_ROI_FEATURE', True),
         source_fusion_mode=os.environ.get('GOAR_SOURCE_FUSION_MODE', 'uncertainty'),
         refine_ocr_anchor=_env_bool('GOAR_REFINE_OCR_ANCHOR', True),
+        spatial_injection=_env_bool('GOAR_SPATIAL_INJECTION', True),
+        ocr_evidence_injection=_env_bool('GOAR_OCR_EVIDENCE_INJECTION', True),
+        record_injection_stats=_env_bool('GOAR_RECORD_INJECTION_STATS', False),
+        injection_stats_path=os.environ.get('GOAR_INJECTION_STATS_PATH'),
     ).to(device=anchor.device, dtype=anchor.dtype)
     model.config.enable_goar = True
     model._goar_forward_origin = model.forward
